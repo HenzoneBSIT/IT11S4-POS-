@@ -1,0 +1,1015 @@
+#define _CRT_SECURE_NO_WARNINGS   // NEW: stops Visual Studio from rejecting localtime() below (harmless elsewhere)
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <iomanip>    // fixed + setprecision: always show prices with 2 decimal places
+#include <ctime>      // NEW: lets the program read today's date for the daily sales summary
+using namespace std;
+
+
+// A Product bundles everything about one menu item into a single unit.
+// NEW: categoryNo says which category the item belongs to (0 to 6, see
+// CATEGORY_NAMES below), and price is now a double so it can have decimals.
+struct Product {
+    string name;
+    int categoryNo;
+    double price;
+    int quantity;
+    int id;   // NEW: the product's ID. It always equals the item number shown in the
+              // menus ([1], [2], ...) and is kept up to date by renumberProducts().
+};
+
+// NEW: Today's sales numbers. date is "YYYY-MM-DD". When the date on the
+// computer no longer matches this date, the daily numbers start again from 0.
+struct DailySales {
+    string date;
+    int transactions;
+    double revenue;
+};
+
+// A User is now a full employee record.
+// NEW: id and fullName were added. Role is "CASHIER", "INVENTORY",
+// "OWNER", or "ADMIN".
+struct User {
+    int id;
+    string fullName;
+    string username;
+    string password;
+    string role;
+};
+
+// Named constants instead of "magic numbers" scattered through the code.
+const int MAX_PRODUCTS = 100;  // maximum number of products the array can ever hold
+const int MAX_USERS    = 100;  // maximum number of employees the array can ever hold
+const int MAX_STOCK    = 10000;
+const int LOW_STOCK_LIMIT = 5;   // NEW: an item with this many or fewer left triggers a low-stock alert
+
+// The menu categories. A product's categoryNo is a position in this array
+// (0 = Rice Bowl, 1 = Main Meal, and so on).
+const int CATEGORY_COUNT = 7;
+const string CATEGORY_NAMES[CATEGORY_COUNT] = {
+    "Rice Bowl", "Main Meal", "Curry", "Noodles", "Dumpling Meal", "Bento", "Sushi"
+};
+
+
+// ===================== IDIOT-PROOF INPUT =====================
+// These functions replace a plain "cin >> something". If the user types
+// something wrong (letters instead of numbers, a number out of range, etc.)
+// they say what is needed and ask again until the answer is valid.
+
+// Asks for a whole number from low to high.
+void getInt(int &number, string prompt, int low, int high) {
+    cout << prompt;
+    cin >> number;
+
+    // cin.fail() is true when the user typed something that is not a number.
+    while (cin.fail() || number < low || number > high) {
+        cin.clear();                 // reset cin so it can be used again
+        cin.ignore(1000, '\n');      // throw away whatever wrong thing was typed
+        cout << "Invalid input! Please enter a whole number from " << low << " to " << high << ": ";
+        cin >> number;
+    }
+
+    cin.ignore(1000, '\n');          // throw away the rest of the line
+}
+
+// Asks for a peso amount. Only 2 decimal places are kept.
+void getMoney(double &amount, string prompt) {
+    cout << prompt;
+    cin >> amount;
+
+    while (cin.fail() || amount < 0.01 || amount > 99999.99) {
+        cin.clear();
+        cin.ignore(1000, '\n');
+        cout << "Invalid amount! Enter a number from 0.01 to 99999.99 (example: 25.50): ";
+        cin >> amount;
+    }
+
+    cin.ignore(1000, '\n');
+
+    // Keep only 2 decimal places: move the decimal point 2 places right,
+    // cut off whatever is left (the + 0.5 rounds it), then move it back.
+    amount = int(amount * 100 + 0.5) / 100.0;
+}
+
+// Asks for one word with no spaces (used for usernames and passwords).
+void getWord(string &word, string prompt) {
+    cout << prompt;
+    cin >> word;
+    cin.ignore(1000, '\n');
+}
+
+// Asks for text that may contain spaces (used for names). Cannot be blank.
+void getText(string &text, string prompt) {
+    cout << prompt;
+    getline(cin, text);
+
+    while (text == "") {
+        cout << "This cannot be blank! " << prompt;
+        getline(cin, text);
+    }
+}
+
+// Asks a yes/no question. The answer must be Y or N.
+void getYesNo(char &answer, string prompt) {
+    cout << prompt;
+    cin >> answer;
+    cin.ignore(1000, '\n');
+
+    while (answer != 'y' && answer != 'Y' && answer != 'n' && answer != 'N') {
+        cout << "Please type Y for yes or N for no: ";
+        cin >> answer;
+        cin.ignore(1000, '\n');
+    }
+}
+
+
+// ===================== NEW: HELPER FUNCTIONS =====================
+
+// Gives every product its ID: the first product is ID 1, the second is ID 2,
+// and so on, so the ID always matches the item number printed in the menus.
+// Called after loading the file, after adding a product and after removing
+// one (because those change the positions in the list).
+void renumberProducts(Product products[], int productCount) {
+    for (int i = 0; i < productCount; i++) {
+        products[i].id = i + 1;
+    }
+}
+
+// Returns today's date from the computer's clock as text, like "2026-10-07".
+string getToday() {
+    time_t now = time(0);                 // seconds since 1970
+    tm *local = localtime(&now);          // break it into year, month, day...
+    char text[11];
+    strftime(text, sizeof(text), "%Y-%m-%d", local);
+    return string(text);
+}
+
+// Adds one finished sale to today's numbers. If the date changed since the
+// last sale, today's numbers are reset to 0 first.
+void recordDailySale(DailySales &daily, double amount) {
+    string today = getToday();
+
+    if (daily.date != today) {
+        daily.date = today;
+        daily.transactions = 0;
+        daily.revenue = 0;
+    }
+
+    daily.transactions++;
+    daily.revenue += amount;
+}
+
+
+// ===================== FILE HANDLING =====================
+
+// Writes the current product list to products.txt so it survives
+// after the program closes. (Product names can have spaces now, so each
+// name gets its own line.)
+void saveInventory(const Product products[], int productCount) {
+    ofstream file("products.txt");
+    file << fixed << setprecision(2);   // save prices with 2 decimal places
+
+    file << productCount << endl;
+
+    for (int i = 0; i < productCount; i++) {
+        file << products[i].name << endl;
+        file << products[i].categoryNo << " "
+             << products[i].price << " "
+             << products[i].quantity << endl;
+    }
+
+    file.close();
+}
+
+// Reads a previously saved product list back from products.txt, if it exists.
+void loadInventory(Product products[], int &productCount) {
+    ifstream file("products.txt");
+
+    if (file) {
+        int savedCount;
+        file >> savedCount;
+        file.ignore(1000, '\n');         // skip the end of the line with the count
+
+        for (int i = 0; i < savedCount; i++) {
+            getline(file, products[i].name);   // getline because names have spaces
+            file >> products[i].categoryNo
+                 >> products[i].price
+                 >> products[i].quantity;
+            file.ignore(1000, '\n');
+        }
+
+        productCount = savedCount;
+        file.close();
+    }
+}
+
+// Saves every employee record to employees.txt.
+void saveEmployees(const User users[], int userCount) {
+    ofstream file("employees.txt");
+
+    file << userCount << endl;
+
+    for (int i = 0; i < userCount; i++) {
+        file << users[i].id << endl;
+        file << users[i].fullName << endl;
+        file << users[i].username << " "
+             << users[i].password << " "
+             << users[i].role << endl;
+    }
+
+    file.close();
+}
+
+// Reads the saved employee records back, if the file exists.
+void loadEmployees(User users[], int &userCount) {
+    ifstream file("employees.txt");
+
+    if (file) {
+        int savedCount;
+        file >> savedCount;
+        file.ignore(1000, '\n');
+
+        for (int i = 0; i < savedCount; i++) {
+            file >> users[i].id;
+            file.ignore(1000, '\n');
+            getline(file, users[i].fullName);
+            file >> users[i].username >> users[i].password >> users[i].role;
+            file.ignore(1000, '\n');
+        }
+
+        userCount = savedCount;
+        file.close();
+    }
+}
+
+// The total sales of the business is one number, saved in sales.txt.
+void saveSales(double totalSales) {
+    ofstream file("sales.txt");
+    file << fixed << setprecision(2);
+    file << totalSales << endl;
+    file.close();
+}
+
+void loadSales(double &totalSales) {
+    ifstream file("sales.txt");
+
+    if (file) {
+        file >> totalSales;
+        file.close();
+    }
+}
+
+// NEW: Today's date, number of transactions and revenue are saved in daily_sales.txt.
+void saveDailySales(const DailySales &daily) {
+    ofstream file("daily_sales.txt");
+    file << fixed << setprecision(2);
+    file << daily.date << endl;
+    file << daily.transactions << " " << daily.revenue << endl;
+    file.close();
+}
+
+void loadDailySales(DailySales &daily) {
+    ifstream file("daily_sales.txt");
+
+    if (file) {
+        file >> daily.date >> daily.transactions >> daily.revenue;
+        file.close();
+    }
+}
+
+
+// ===================== DISPLAY FUNCTIONS =====================
+
+// Customer-facing view: name and price only, grouped by category.
+void displayMenu(const Product products[], int productCount) {
+    cout << "\n====== MENU ======" << endl;
+
+    for (int i = 0; i < productCount; i++) {
+        // The list is always kept in category order, so a new heading is
+        // printed whenever the category changes from the previous item.
+        if (i == 0 || products[i].categoryNo != products[i - 1].categoryNo) {
+            cout << "\n--- " << CATEGORY_NAMES[products[i].categoryNo] << " ---" << endl;
+        }
+
+        cout << "[" << i + 1 << "] "
+             << products[i].name << " - P"
+             << products[i].price << endl;
+    }
+}
+
+// Staff-facing view: ID, name, price, AND quantity, grouped by category.
+// NEW: printed as a table. setw() reserves a fixed width for each column so
+// everything lines up; left / right choose which side the text sticks to.
+void displayInventory(const Product products[], int productCount) {
+    cout << "\n====== VIEWING INVENTORY ======" << endl;
+
+    cout << left  << setw(5)  << "ID"
+         << setw(36) << "PRODUCT"
+         << right << setw(11) << "PRICE (P)"
+         << setw(6)  << "QTY"
+         << "   STATUS" << endl;
+    cout << string(72, '-') << endl;
+
+    for (int i = 0; i < productCount; i++) {
+        if (i == 0 || products[i].categoryNo != products[i - 1].categoryNo) {
+            cout << "\n--- " << CATEGORY_NAMES[products[i].categoryNo] << " ---" << endl;
+        }
+
+        // The status column warns about items that are low or gone.
+        string status = "OK";
+        if (products[i].quantity == 0) {
+            status = "OUT OF STOCK";
+        }
+        else if (products[i].quantity <= LOW_STOCK_LIMIT) {
+            status = "LOW STOCK";
+        }
+
+        cout << left  << setw(5)  << products[i].id
+             << setw(36) << products[i].name
+             << right << setw(11) << products[i].price
+             << setw(6)  << products[i].quantity
+             << "   " << status << endl;
+    }
+}
+
+// NEW: Out-of-stock report. Shows ONLY the products whose quantity is zero.
+void displayOutOfStock(const Product products[], int productCount) {
+    cout << "\n====== OUT-OF-STOCK REPORT ======" << endl;
+
+    int outCount = 0;
+
+    for (int i = 0; i < productCount; i++) {
+        if (products[i].quantity == 0) {
+            // Print the table header only once, right before the first item.
+            if (outCount == 0) {
+                cout << left << setw(5) << "ID"
+                     << setw(36) << "PRODUCT"
+                     << "CATEGORY" << endl;
+                cout << string(60, '-') << endl;
+            }
+
+            cout << left << setw(5) << products[i].id
+                 << setw(36) << products[i].name
+                 << CATEGORY_NAMES[products[i].categoryNo] << endl;
+
+            outCount++;
+        }
+    }
+
+    if (outCount == 0) {
+        cout << "Good news! No items are out of stock." << endl;
+    } else {
+        cout << "\nTotal items out of stock: " << outCount << endl;
+    }
+}
+
+// NEW: Prints a simple receipt for one finished sale.
+void printReceipt(const Product &item, int quantity, double total, double payment, double change) {
+    cout << "\n==============================" << endl;
+    cout << "           RECEIPT" << endl;
+    cout << "==============================" << endl;
+    cout << left << setw(14) << "Item ID:"    << item.id << endl;
+    cout << setw(14) << "Item:"       << item.name << endl;
+    cout << setw(14) << "Unit Price:" << "P" << item.price << endl;
+    cout << setw(14) << "Quantity:"   << quantity << endl;
+    cout << "------------------------------" << endl;
+    cout << setw(14) << "Subtotal:"   << "P" << total << endl;
+    cout << setw(14) << "Cash:"       << "P" << payment << endl;
+    cout << setw(14) << "Change:"     << "P" << change << endl;
+    cout << "==============================" << endl;
+    cout << "    Thank you! Come again!" << endl;
+    cout << right;   // put the alignment back to normal
+}
+
+
+// ===================== CASHIER FUNCTIONS =====================
+
+// Handles one purchase: pick an item, pick a quantity, pay, get change.
+// totalSales is passed by reference (&) so every sale is added to the
+// business's running total.
+void buyProduct(Product products[], int productCount, double &totalSales, DailySales &daily) {
+    cout << "\n====== TRANSACTION ======" << endl;
+    displayMenu(products, productCount);
+
+    int itemno, buyQuantity;
+    double total, payment, change;
+
+    getInt(itemno, "\nInput Item No. (0 to cancel): ", 0, productCount);
+
+    if (itemno == 0) {
+        cout << "Transaction cancelled." << endl;
+    }
+    else {
+        int index = itemno - 1;  // convert "item #1" into array index 0
+
+        if (products[index].quantity == 0) {
+            cout << "Sorry, " << products[index].name << " is out of stock!" << endl;
+        }
+        else {
+            cout << "Available stock: " << products[index].quantity << endl;
+            getInt(buyQuantity, "Input quantity: ", 1, products[index].quantity);
+
+            total = products[index].price * buyQuantity;
+            total = int(total * 100 + 0.5) / 100.0;   // keep 2 decimal places
+
+            cout << "\nItem: " << products[index].name << endl;
+            cout << "Quantity: " << buyQuantity << endl;
+            cout << "TOTAL AMOUNT: P" << total << endl;
+
+            getMoney(payment, "Enter Payment Amount: P");
+
+            // Stock is only reduced (and the sale only counted) INSIDE this
+            // successful-payment branch.
+            if (payment >= total) {
+                change = payment - total;
+                products[index].quantity -= buyQuantity;
+                totalSales += total;
+                recordDailySale(daily, total);
+
+                cout << "Change: P" << change << endl;
+                cout << "Transaction Complete! Stock updated." << endl;
+            } else {
+                cout << "Insufficient Payment!" << endl;
+            }
+        }
+    }
+}
+
+
+// ===================== INVENTORY FUNCTIONS =====================
+
+// Lets inventory staff add a brand new product to the catalog.
+void addProduct(Product products[], int &productCount) {
+    if (productCount >= MAX_PRODUCTS) {
+        cout << "Product list is full! Cannot add more items.\n";
+        return;
+    }
+
+    string name;
+    int categoryNo, qty;
+    double price;
+
+    cout << "\n====== ADD PRODUCT ======" << endl;
+    getText(name, "Enter new product name: ");
+
+    cout << "\nCategories:" << endl;
+    for (int i = 0; i < CATEGORY_COUNT; i++) {
+        cout << "[" << i + 1 << "] " << CATEGORY_NAMES[i] << endl;
+    }
+    getInt(categoryNo, "Select category number: ", 1, CATEGORY_COUNT);
+    categoryNo = categoryNo - 1;   // the user types 1-7, the array uses 0-6
+
+    getMoney(price, "Enter price: P");
+    getInt(qty, "Enter starting quantity: ", 0, MAX_STOCK);
+
+    // The list must stay in category order, so find the spot right after
+    // the last product whose category is the same or lower...
+    int position = 0;
+    while (position < productCount && products[position].categoryNo <= categoryNo) {
+        position++;
+    }
+
+    // ...move everything from that spot onward down by one to make a gap...
+    for (int i = productCount; i > position; i--) {
+        products[i] = products[i - 1];
+    }
+
+    // ...and put the new product in the gap.
+    products[position].name = name;
+    products[position].categoryNo = categoryNo;
+    products[position].price = price;
+    products[position].quantity = qty;
+
+    productCount++;
+    renumberProducts(products, productCount);
+
+    cout << "Product added successfully!\n";
+}
+
+// Lets inventory staff add to (or correct) an existing product's stock.
+void updateStock(Product products[], int productCount) {
+    displayInventory(products, productCount);
+
+    int choice, change;
+
+    getInt(choice, "\nSelect product number to update (0 to cancel): ", 0, productCount);
+
+    if (choice == 0) {
+        cout << "No changes made.\n";
+    }
+    else {
+        int index = choice - 1;
+        int stock = products[index].quantity;
+
+        cout << "Current stock of " << products[index].name << ": " << stock << endl;
+
+        // The lowest allowed number is -stock, so the stock can never go below 0.
+        getInt(change, "Enter quantity to add (negative number to subtract, 0 to cancel): ",
+               -stock, MAX_STOCK - stock);
+
+        products[index].quantity += change;
+        cout << "Updated! New quantity: " << products[index].quantity << endl;
+    }
+}
+
+// Lets inventory staff remove a product from the catalog.
+void removeProduct(Product products[], int &productCount) {
+    displayInventory(products, productCount);
+
+    int choice;
+    char answer;
+
+    getInt(choice, "\nSelect product number to remove (0 to cancel): ", 0, productCount);
+
+    if (choice == 0) {
+        cout << "Removal cancelled.\n";
+    }
+    else {
+        int index = choice - 1;
+
+        cout << "You are about to remove: " << products[index].name << endl;
+        getYesNo(answer, "Are you sure? (Y/N): ");
+
+        if (answer == 'y' || answer == 'Y') {
+            // Move every product after it up by one to close the gap.
+            for (int i = index; i < productCount - 1; i++) {
+                products[i] = products[i + 1];
+            }
+            productCount--;
+            renumberProducts(products, productCount);
+
+            cout << "Product removed successfully!\n";
+        } else {
+            cout << "Removal cancelled.\n";
+        }
+    }
+}
+
+
+// ===================== OWNER FUNCTIONS =====================
+
+// Lets the owner change a product's price at runtime.
+void changePrice(Product products[], int productCount) {
+    displayMenu(products, productCount);  // show current prices first
+
+    int choice;
+    double newPrice;
+
+    getInt(choice, "\nSelect product number to reprice (0 to cancel): ", 0, productCount);
+
+    if (choice == 0) {
+        cout << "No changes made.\n";
+    }
+    else {
+        int index = choice - 1;
+
+        cout << "Current price of " << products[index].name << ": P" << products[index].price << endl;
+        getMoney(newPrice, "Enter new price: P");
+
+        products[index].price = newPrice;
+        cout << "Price updated successfully!\n";
+    }
+}
+
+// Shows the total sales of the business. Only the owner's menu has this.
+void viewSales(double totalSales) {
+    cout << "\n====== TOTAL SALES ======" << endl;
+    cout << "Total sales of the business: P" << totalSales << endl;
+}
+
+
+// ===================== ADMIN FUNCTIONS =====================
+
+// Shows every employee. Passwords are not shown.
+void viewEmployees(const User users[], int userCount) {
+    cout << "\n====== EMPLOYEE LIST ======" << endl;
+    cout << "[ID] NAME - USERNAME - ROLE" << endl;
+
+    for (int i = 0; i < userCount; i++) {
+        cout << "[" << users[i].id << "] "
+             << users[i].fullName << " - "
+             << users[i].username << " - "
+             << users[i].role << endl;
+    }
+}
+
+void addEmployee(User users[], int &userCount) {
+    if (userCount >= MAX_USERS) {
+        cout << "Employee list is full! Cannot add more employees.\n";
+        return;
+    }
+
+    string fullName, username, password, role;
+    int roleChoice;
+    bool taken;
+
+    cout << "\n====== ADD EMPLOYEE ======" << endl;
+    getText(fullName, "Full name: ");
+
+    // Keep asking until the username is not used by anyone else.
+    do {
+        taken = false;
+        getWord(username, "Username (no spaces): ");
+
+        for (int i = 0; i < userCount; i++) {
+            if (users[i].username == username) {
+                taken = true;
+            }
+        }
+
+        if (taken) {
+            cout << "That username is already taken! Try another one.\n";
+        }
+    } while (taken);
+
+    getWord(password, "Password (no spaces): ");
+
+    cout << "\nRoles:\n";
+    cout << "[1] CASHIER\n";
+    cout << "[2] INVENTORY\n";
+    cout << "[3] OWNER\n";
+    cout << "[4] ADMIN\n";
+    getInt(roleChoice, "Select role number: ", 1, 4);
+
+    switch (roleChoice) {
+        case 1: role = "CASHIER";   break;
+        case 2: role = "INVENTORY"; break;
+        case 3: role = "OWNER";     break;
+        case 4: role = "ADMIN";     break;
+    }
+
+    // The new ID is one higher than the biggest ID that exists.
+    int newId = 0;
+    for (int i = 0; i < userCount; i++) {
+        if (users[i].id > newId) {
+            newId = users[i].id;
+        }
+    }
+    newId++;
+
+    users[userCount].id = newId;
+    users[userCount].fullName = fullName;
+    users[userCount].username = username;
+    users[userCount].password = password;
+    users[userCount].role = role;
+    userCount++;
+
+    cout << "Employee added successfully! Employee ID: " << newId << endl;
+}
+
+// myId is the ID of the admin who is logged in (so they can't remove themselves).
+void removeEmployee(User users[], int &userCount, int myId) {
+    viewEmployees(users, userCount);
+
+    int id;
+    char answer;
+
+    getInt(id, "\nEnter the ID of the employee to remove (0 to cancel): ", 0, 999999);
+
+    if (id == 0) {
+        cout << "Removal cancelled.\n";
+        return;
+    }
+
+    // Look for the employee with that ID. index stays -1 if nobody has it.
+    int index = -1;
+    for (int i = 0; i < userCount; i++) {
+        if (users[i].id == id) {
+            index = i;
+        }
+    }
+
+    if (index == -1) {
+        cout << "No employee has that ID.\n";
+    }
+    else if (users[index].id == myId) {
+        cout << "You cannot remove your own account while logged in.\n";
+    }
+    else {
+        cout << "You are about to remove: " << users[index].fullName
+             << " (" << users[index].role << ")" << endl;
+        getYesNo(answer, "Are you sure? (Y/N): ");
+
+        if (answer == 'y' || answer == 'Y') {
+            for (int i = index; i < userCount - 1; i++) {
+                users[i] = users[i + 1];
+            }
+            userCount--;
+
+            cout << "Employee removed successfully!\n";
+        } else {
+            cout << "Removal cancelled.\n";
+        }
+    }
+}
+
+
+// ===================== ROLE MENUS =====================
+// ROLE-BASED ACCESS CONTROL: each role gets its OWN menu, and a menu only
+// contains the functions that role is allowed to use. login() tells main()
+// which role the account has, and main() sends the user to exactly one menu.
+//
+//   CASHIER   : view inventory, buy product
+//   INVENTORY : view stock, add product, update stock, remove product
+//   OWNER     : view inventory, buy product, add product, update stock,
+//               change price, view sales
+//   ADMIN     : view employees, add employee, remove employee
+
+void cashierMenu(Product products[], int &productCount, double &totalSales, DailySales &daily) {
+    int choice;
+
+    do {
+        cout << "\n=============================\n";
+        cout << "       CASHIER MENU\n";
+        cout << "=============================\n";
+        cout << "1. View Inventory\n";
+        cout << "2. Buy Product\n";
+        cout << "3. Logout\n";
+        cout << "=============================\n";
+        getInt(choice, "Enter choice: ", 1, 3);
+
+        switch (choice) {
+            case 1:
+                displayInventory(products, productCount);
+                break;
+
+            case 2:
+                buyProduct(products, productCount, totalSales, daily);
+                break;
+
+            case 3:
+                // Save on logout: a cashier's purchases change stock and sales.
+                saveInventory(products, productCount);
+                saveSales(totalSales);
+                saveDailySales(daily);
+                cout << "\nInventory and sales are now saved!" << endl;
+                cout << "Logging out...\n";
+                break;
+        }
+    } while (choice != 3);
+}
+
+void inventoryMenu(Product products[], int &productCount) {
+    int choice;
+
+    do {
+        cout << "\n=============================\n";
+        cout << "      INVENTORY MENU\n";
+        cout << "=============================\n";
+        cout << "1. View Stock\n";
+        cout << "2. Add Product\n";
+        cout << "3. Update Stock\n";
+        cout << "4. Remove Product\n";
+        cout << "5. Logout\n";
+        cout << "=============================\n";
+        getInt(choice, "Enter choice: ", 1, 5);
+
+        switch (choice) {
+            case 1:
+                displayInventory(products, productCount);
+                break;
+
+            case 2:
+                addProduct(products, productCount);
+                break;
+
+            case 3:
+                updateStock(products, productCount);
+                break;
+
+            case 4:
+                removeProduct(products, productCount);
+                break;
+
+            case 5:
+                saveInventory(products, productCount);
+                cout << "\nInventory is now saved!" << endl;
+                cout << "Logging out...\n";
+                break;
+        }
+    } while (choice != 5);
+}
+
+// The owner menu has the cashier and inventory options (except Remove
+// Product, which is inventory-only), plus Change Price and View Sales.
+void ownerMenu(Product products[], int &productCount, double &totalSales, DailySales &daily) {
+    int choice;
+
+    do {
+        cout << "\n=============================\n";
+        cout << "        OWNER MENU\n";
+        cout << "=============================\n";
+        cout << "1. View Inventory\n";
+        cout << "2. Buy Product\n";
+        cout << "3. Add Product\n";
+        cout << "4. Update Stock\n";
+        cout << "5. Change Price\n";
+        cout << "6. View Sales\n";
+        cout << "7. Logout\n";
+        cout << "=============================\n";
+        getInt(choice, "Enter choice: ", 1, 7);
+
+        switch (choice) {
+            case 1:
+                displayInventory(products, productCount);
+                break;
+
+            case 2:
+                buyProduct(products, productCount, totalSales, daily);
+                break;
+
+            case 3:
+                addProduct(products, productCount);
+                break;
+
+            case 4:
+                updateStock(products, productCount);
+                break;
+
+            case 5:
+                changePrice(products, productCount);
+                break;
+
+            case 6:
+                viewSales(totalSales);
+                break;
+
+            case 7:
+                saveInventory(products, productCount);
+                saveSales(totalSales);
+                saveDailySales(daily);
+                cout << "\nInventory and sales are now saved!" << endl;
+                cout << "Logging out...\n";
+                break;
+        }
+    } while (choice != 7);
+}
+
+void adminMenu(User users[], int &userCount, int myId) {
+    int choice;
+
+    do {
+        cout << "\n=============================\n";
+        cout << "        ADMIN MENU\n";
+        cout << "=============================\n";
+        cout << "1. View Employees\n";
+        cout << "2. Add Employee\n";
+        cout << "3. Remove Employee\n";
+        cout << "4. Logout\n";
+        cout << "=============================\n";
+        getInt(choice, "Enter choice: ", 1, 4);
+
+        switch (choice) {
+            case 1:
+                viewEmployees(users, userCount);
+                break;
+
+            case 2:
+                addEmployee(users, userCount);
+                break;
+
+            case 3:
+                removeEmployee(users, userCount, myId);
+                break;
+
+            case 4:
+                saveEmployees(users, userCount);
+                cout << "\nEmployee records are now saved!" << endl;
+                cout << "Logging out...\n";
+                break;
+        }
+    } while (choice != 4);
+}
+
+
+// ===================== LOGIN =====================
+
+// Checks the entered username/password against every account in the
+// roster. Returns whether a match was found, and copies the matched
+// employee's whole record back through loggedIn (passed by reference).
+bool login(User users[], int userCount, User &loggedIn) {
+    string inputUsername, inputPassword;
+
+    getWord(inputUsername, "Username: ");
+    getWord(inputPassword, "Password: ");
+
+    for (int i = 0; i < userCount; i++) {
+        if (inputUsername == users[i].username && inputPassword == users[i].password) {
+            loggedIn = users[i];
+            return true;  // exits immediately; also stops checking further accounts
+        }
+    }
+
+    return false;  // no account in the whole roster matched
+}
+
+
+// ===================== MAIN =====================
+
+int main() {
+    // From here on, every decimal number printed shows exactly 2 decimal places.
+    cout << fixed << setprecision(2);
+
+    // ---- Product catalog (starts with 15, can grow up to MAX_PRODUCTS) ----
+    // Each product is { name, categoryNo, price, quantity }, listed in
+    // category order. NOTE: the prices and quantities are PLACEHOLDERS.
+    Product products[MAX_PRODUCTS];
+    int productCount = 15;
+
+    // Rice Bowl (0)
+    products[0]  = {"Chicken Teriyaki Don",            0, 149.00, 20};
+    products[1]  = {"Beef Gyudon",                     0, 159.00, 20};
+    products[2]  = {"Chicken Katsu Don",               0, 155.00, 20};
+    products[3]  = {"Tempura Rice Bowl",               0, 169.00, 20};
+    // Main Meal (1)
+    products[4]  = {"Tonkatsu",                        1, 179.00, 20};
+    products[5]  = {"Chicken Katsu",                   1, 165.00, 20};
+    products[6]  = {"Chicken Karaage Meal",            1, 159.00, 20};
+    // Curry (2)
+    products[7]  = {"Japanese Curry with Chicken Katsu", 2, 175.00, 20};
+    products[8]  = {"Beef Japanese Curry",             2, 185.00, 20};
+    // Noodles (3)
+    products[9]  = {"Yakisoba",                        3, 139.00, 20};
+    products[10] = {"Yaki Udon",                       3, 149.00, 20};
+    products[11] = {"Ramen",                           3, 169.00, 20};
+    // Dumpling Meal (4)
+    products[12] = {"Gyoza Meal",                      4, 129.00, 20};
+    // Bento (5)
+    products[13] = {"Chicken Teriyaki Bento",          5, 189.00, 20};
+    // Sushi (6)
+    products[14] = {"Sushi California Roll Meal",      6, 175.00, 20};
+
+    // If products.txt exists from a previous run, this overwrites the
+    // defaults above with the saved data.
+    loadInventory(products, productCount);
+    renumberProducts(products, productCount);
+
+    // ---- Total sales of the business ----
+    double totalSales = 0;
+    loadSales(totalSales);
+
+    DailySales daily = {"", 0, 0.0};
+    loadDailySales(daily);
+
+    // ---- Employee accounts: 1 admin, 10 cashiers, 10 inventory managers, 5 owners ----
+    // Each one is { id, full name, username, password, role }.
+    // NOTE for the report: these are placeholder credentials for
+    // development/testing. The admin can add or remove employees while
+    // the program is running.
+    User users[MAX_USERS] = {
+        {1,  "KC Brendia", "admin1", "4441", "ADMIN"},
+
+        {2,  "JM Perez",  "cashier1",  "1111", "CASHIER"},
+        {3,  "Rian Henson",  "cashier2",  "1112", "CASHIER"},
+        {4,  "Ross Nambio",  "cashier3",  "1113", "CASHIER"},
+        {5,  "Aldrich Labitoria",  "cashier4",  "1114", "CASHIER"},
+        {6,  "Yuji Tiamzon",  "cashier5",  "1115", "CASHIER"},
+        {7,  "Jithro Valencia",  "cashier6",  "1116", "CASHIER"},
+        {8,  "James Gallero",  "cashier7",  "1117", "CASHIER"},
+  
+
+        {9, "Jaimar Vergara",  "inventory1",  "2221", "INVENTORY"},
+        {10, "Blein Estabillo",  "inventory2",  "2222", "INVENTORY"},
+        {11, "Herald Alejandro",  "inventory3",  "2223", "INVENTORY"},
+        {12, "Jervie Alejandrino",  "inventory4",  "2224", "INVENTORY"},
+        {13, "JC Bornilla",  "inventory5",  "2225", "INVENTORY"},
+
+
+        {14, "Luap", "owner1", "3331", "OWNER"},
+        {15, "Leachim", "owner2", "3332", "OWNER"},
+        {16, "Olavera", "owner3", "3333", "OWNER"},
+
+    };
+    int userCount = 16;
+
+    // If employees.txt exists, the saved employee list replaces the starter one.
+    loadEmployees(users, userCount);
+
+    User loggedIn;   // will hold the record of whoever logs in
+    bool authenticated = login(users, userCount, loggedIn);
+
+    if (authenticated) {
+        cout << "\nLogin successful!\n";
+        cout << "Welcome, " << loggedIn.fullName << endl;
+        cout << "Role: " << loggedIn.role << endl;
+
+        // The role decides exactly ONE of the four menus to enter.
+        if (loggedIn.role == "CASHIER") {
+            cashierMenu(products, productCount, totalSales, daily);
+        }
+        else if (loggedIn.role == "INVENTORY") {
+            inventoryMenu(products, productCount);
+        }
+        else if (loggedIn.role == "OWNER") {
+            ownerMenu(products, productCount, totalSales, daily);
+        }
+        else if (loggedIn.role == "ADMIN") {
+            adminMenu(users, userCount, loggedIn.id);
+        }
+    } else {
+        cout << "Login Failed! Wrong username or password." << endl;
+    }
+
+    return 0;
+}
